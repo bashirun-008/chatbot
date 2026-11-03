@@ -3,14 +3,14 @@ import math
 import os
 import re
 from collections import Counter
-from datetime import date
 from pathlib import Path
 
-import anthropic
 import streamlit as st
+from google import genai
+from google.genai import types
 
 DATA_DIR = Path(__file__).parent / "data"
-MODEL = "claude-sonnet-4-6"
+MODEL = "gemini-flash-latest"  # free-tier Flash model; override with GEMINI_MODEL in secrets
 TOP_K = 5
 
 st.set_page_config(page_title="BVRIT Assistant", page_icon="🎓", layout="centered")
@@ -61,17 +61,18 @@ SYSTEM = """You are the BVRIT Hyderabad College of Engineering for Women assista
 Rules:
 - Answer ONLY from the CONTEXT provided. If the answer is not there, say you don't have that information and suggest contacting the Examination Branch / HoD / Principal's office as appropriate.
 - Be concise and specific: quote exact dates, amounts and rules. Mention the source document name.
-- Today's date is {today}. When asked about deadlines or late fees, work out which window applies today and say if a window has already passed.
+- Treat the documents as the current reference material. Do not comment on whether dates or deadlines have passed.
 - Never invent policies, fees or dates."""
 
 
-def get_client():
-    key = st.secrets.get("ANTHROPIC_API_KEY") if hasattr(st, "secrets") else None
-    key = key or os.getenv("ANTHROPIC_API_KEY")
-    if not key:
-        st.error("Missing ANTHROPIC_API_KEY. Add it in Streamlit secrets or as an environment variable.")
-        st.stop()
-    return anthropic.Anthropic(api_key=key)
+def get_key():
+    key = st.secrets.get("GEMINI_API_KEY") if hasattr(st, "secrets") else None
+    return key or os.getenv("GEMINI_API_KEY")
+
+
+def get_model():
+    m = st.secrets.get("GEMINI_MODEL") if hasattr(st, "secrets") else None
+    return m or os.getenv("GEMINI_MODEL") or MODEL
 
 
 # ---------- UI ----------
@@ -108,19 +109,32 @@ if prompt := st.chat_input("Ask a question..."):
     hits = search(recent)
     context = "\n\n---\n\n".join(f"[Source: {h['source']}]\n{h['text']}" for h in hits) or "(no relevant context found)"
 
-    system = SYSTEM.format(today=date.today().strftime("%A, %d %B %Y")) + f"\n\nCONTEXT:\n{context}"
-    history = [{"role": m["role"], "content": m["content"]} for m in st.session_state.messages[-10:]]
+    system = SYSTEM + f"\n\nCONTEXT:\n{context}"
+    history = [
+        types.Content(role="user" if m["role"] == "user" else "model", parts=[types.Part(text=m["content"])])
+        for m in st.session_state.messages[-10:]
+    ]
 
     with st.chat_message("assistant"):
-        try:
-            client = get_client()
-            with client.messages.stream(model=MODEL, max_tokens=1000, system=system, messages=history) as stream:
-                reply = st.write_stream(stream.text_stream)
-        except Exception as e:
-            reply = f"Sorry, something went wrong: {e}"
-            st.error(reply)
+        key = get_key()
+        if not key:
+            # No API key: fall back to showing the best-matching passages
+            reply = "_No API key set, showing the most relevant passages instead:_\n\n" + context
+            st.markdown(reply)
+        else:
+            try:
+                client = genai.Client(api_key=key)
+                stream = client.models.generate_content_stream(
+                    model=get_model(),
+                    contents=history,
+                    config=types.GenerateContentConfig(system_instruction=system, max_output_tokens=1000),
+                )
+                reply = st.write_stream(c.text for c in stream if c.text)
+            except Exception as e:
+                reply = f"Sorry, something went wrong: {e}"
+                st.error(reply)
         if hits:
             with st.expander("Sources used"):
-                for s in sorted({h["source"] for h in hits}):
-                    st.write("•", s)
+                for src in sorted({h["source"] for h in hits}):
+                    st.write("•", src)
     st.session_state.messages.append({"role": "assistant", "content": reply})
